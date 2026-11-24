@@ -117,15 +117,15 @@ def features(m15, daily):
     for i in range(n):
         if i > 0 and not np.isnan(atr[i - 1]):
             pu, pl = up[i - 1], lo[i - 1]
-            lo[i] = lo[i] if (lo[i] > pl or c[i - 1] < pl) else pl
-            up[i] = up[i] if (up[i] < pu or c[i - 1] > pu) else pu
-            dirn[i] = (-1 if c[i] > up[i] else 1) if st[i - 1] == pu else (1 if c[i] < lo[i] else -1)
+            lo[i] = lo[i] if (lo[i] > pl or pl > c[i - 1]) else pl
+            up[i] = up[i] if (pu > up[i] or c[i - 1] > pu) else pu
+            dirn[i] = (-1 if c[i] > up[i] else 1) if st[i - 1] == pu else (1 if lo[i] > c[i] else -1)
         else:
             dirn[i] = 1
         st[i] = lo[i] if dirn[i] == -1 else up[i]
     prev = np.r_[1, dirn[:-1]]
-    d["stUp"] = (dirn < 0) & (prev > 0)
-    d["stDn"] = (dirn > 0) & (prev < 0)
+    d["stUp"] = (0 > dirn) & (prev > 0)
+    d["stDn"] = (dirn > 0) & (0 > prev)
     # previous day H/L/C from daily candles
     dd = daily.copy(); dd["date"] = dd.t.dt.date
     dd = dd.set_index("date")[["h", "l", "c"]].sort_index()
@@ -134,8 +134,8 @@ def features(m15, daily):
     pp = (d.pH + d.pL + d.pC) / 3; bc0 = (d.pH + d.pL) / 2; tc0 = 2 * pp - bc0
     d["TC"] = np.maximum(tc0, bc0); d["BC"] = np.minimum(tc0, bc0)
     pc = d.c.shift(1)
-    d["cprUp"] = (d.c > d.TC) & (pc <= d.TC)
-    d["cprDn"] = (d.c < d.BC) & (pc >= d.BC)
+    d["cprUp"] = (d.c > d.TC) & (d.TC >= pc)
+    d["cprDn"] = (d.BC > d.c) & (pc >= d.BC)
     # noise band (14-day) + intraday average price
     d["dOpen"] = d.groupby("date").o.transform("first")
     d["mv"] = (d.c / d.dOpen - 1).abs()
@@ -147,7 +147,7 @@ def features(m15, daily):
     d["LB"] = np.minimum(d.dOpen, d.pC) * (1 - d.sigma)
     chk = (d.mins % 30 == 0) & d.sigma.notna()
     d["nzUp"] = chk & (d.c > d.UB) & (d.c > d.vw)
-    d["nzDn"] = chk & (d.c < d.LB) & (d.c < d.vw)
+    d["nzDn"] = chk & (d.LB > d.c) & (d.vw > d.c)
     return d
 
 def replay_today(d, today):
@@ -158,15 +158,15 @@ def replay_today(d, today):
     for _, r in t.iterrows():
         if s["dir"] != 0 and not s["exited"]:
             # stop check (orders from previous candle)
-            if s["dir"] == 1 and r.l <= s["stop"]:
+            if s["dir"] == 1 and s["stop"] >= r.l:
                 s.update(exited=True, exit_px=min(s["stop"], r.o), reason="BE" if s["be"] else "SL", exit_time=r.ct)
             elif s["dir"] == -1 and r.h >= s["stop"]:
                 s.update(exited=True, exit_px=max(s["stop"], r.o), reason="BE" if s["be"] else "SL", exit_time=r.ct)
-            elif not s["be"] and ((s["dir"] == 1 and r.h >= s["entry"] + SL) or (s["dir"] == -1 and r.l <= s["entry"] - SL)):
+            elif not s["be"] and ((s["dir"] == 1 and r.h >= s["entry"] + SL) or (s["dir"] == -1 and s["entry"] - SL >= r.l)):
                 s.update(stop=s["entry"], be=True, be_time=r.ct)
             if not s["exited"] and r.hhmm >= 1515:
                 s.update(exited=True, exit_px=r.c, reason="3:15", exit_time=r.ct)
-        if not s["traded"] and START_HHMM <= r.hhmm < LAST_HHMM and not pd.isna(r.pC):
+        if not s["traded"] and r.hhmm >= START_HHMM and LAST_HHMM > r.hhmm and not pd.isna(r.pC):
             gl = bool(r.cprUp or r.stUp or r.nzUp); gs = bool(r.cprDn or r.stDn or r.nzDn)
             if gl != gs:
                 dr = 1 if gl else -1
@@ -204,4 +204,57 @@ def main():
             t_now = now()
             if hm(t_now) >= END_HHMM:
                 break
-            if hm(t_now) 
+            if 915 > hm(t_now):
+                time.sleep(60); continue
+            m15 = candles(obj, "FIFTEEN_MINUTE", 45)
+            if (m15.t.dt.date == today).sum() == 0:
+                if hm(t_now) >= 1000:
+                    log("no candles today - holiday?"); break
+                time.sleep(60); continue
+            done = m15[t_now - pd.Timedelta(seconds=5) >= m15.t + pd.Timedelta(minutes=15)]
+            forming = m15[m15.t + pd.Timedelta(minutes=15) > t_now - pd.Timedelta(seconds=5)]
+            d = features(done, daily)
+            s = replay_today(d, today)
+            px = ltp(obj)
+            if s["dir"] != 0 and not s["exited"]:
+                lows = [x for x in [px] + list(forming.l) if x is not None]
+                highs = [x for x in [px] + list(forming.h) if x is not None]
+                if (s["dir"] == 1 and lows and s["stop"] >= min(lows)) or (s["dir"] == -1 and highs and max(highs) >= s["stop"]):
+                    s.update(exited=True, exit_px=s["stop"], reason="BE" if s["be"] else "SL", exit_time=t_now)
+            if s["traded"] and "entry" not in sent:
+                sent.add("entry")
+                if fresh(s["entry_time"]):
+                    k, typ = itm_strike(s["entry"], s["dir"])
+                    side = "BUY  ->  CE vaangu" if s["dir"] == 1 else "SELL  ->  PE vaangu"
+                    tg(f"🔔 {side}\nNIFTY entry: {s['entry']:.1f}  ({s['src']})\nOption: NIFTY {k} {typ} (1-ITM, next-week expiry)\nSL (NIFTY): {s['stop'] if not s['be'] else s['entry'] - s['dir'] * SL:.1f}\nNIFTY SL-a thottaa option-a vithudu.")
+            if s["be"] and "be" not in sent and "exit" not in sent:
+                sent.add("be")
+                if fresh(s["be_time"]) and not s["exited"]:
+                    tg(f"✅ +{SL:.0f} points vanthuduchu. SL ippo entry {s['entry']:.1f} (breakeven). Inime nashtam illa.")
+            if s["exited"] and "exit" not in sent:
+                sent.add("exit")
+                if fresh(s["exit_time"]):
+                    pts = (s["exit_px"] - s["entry"]) * s["dir"]
+                    why = {"SL": "SL hit", "BE": "Breakeven exit", "3:15": "3:15 exit"}[s["reason"]]
+                    tg(f"⏹ EXIT ({why})\nNIFTY {s['exit_px']:.1f}  |  {pts:+.1f} points\nOption-a ippo vithudu. Innaikku trade mudinjathu.")
+            if s["traded"] and not s["exited"] and hm(t_now) >= 1515 and "exit" not in sent:
+                sent.add("exit")
+                pts = ((px or s["entry"]) - s["entry"]) * s["dir"]
+                tg(f"⏹ 3:15 EXIT\nNIFTY {px}  |  {pts:+.1f} points\nOption-a ippo vithudu.")
+            if not s["traded"] and hm(t_now) >= 1300 and "nosig" not in sent:
+                sent.add("nosig")
+                tg("Innaikku 1 manikku munnadi signal varala. Trade illa.")
+            log(f"ltp {px} | traded {s['traded']} dir {s['dir']} stop {s['stop']} be {s['be']} exited {s['exited']}")
+        except Exception as e:
+            log("ERROR " + repr(e))
+            traceback.print_exc()
+            try:
+                obj = angel_login()
+            except Exception as e2:
+                log("relogin failed " + repr(e2))
+        time.sleep(max(5, 60 - now().second + 10))
+    if END_HHMM >= 1535:
+        tg("Market mudinjathu. Bot stop aagudhu.")
+
+if __name__ == "__main__":
+    main()
