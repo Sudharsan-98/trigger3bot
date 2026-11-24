@@ -12,10 +12,17 @@ NIFTY_TOKEN, NIFTY_SYM = "99926000", "Nifty 50"
 # ---------------- config ----------------
 cfg = configparser.ConfigParser()
 cfg.read(CFG_PATH, encoding="utf-8")
-C = cfg["settings"]
-API_KEY, CLIENT, PIN, TOTP = C.get("api_key").strip(), C.get("client_id").strip(), C.get("pin").strip(), C.get("totp_secret").strip()
-TG_TOKEN, TG_CHAT = C.get("telegram_token").strip(), C.get("telegram_chat_id", "").strip()
-SL = float(C.get("sl_points", "65"))
+C = cfg["settings"] if cfg.has_section("settings") else {}
+def opt(env, key, default=""):
+    v = os.environ.get(env, "").strip()
+    return v if v else str(C.get(key, default)).strip()
+API_KEY, CLIENT, PIN, TOTP = opt("API_KEY", "api_key"), opt("CLIENT_ID", "client_id"), opt("PIN", "pin"), opt("TOTP_SECRET", "totp_secret")
+TG_TOKEN, TG_CHAT = opt("TELEGRAM_TOKEN", "telegram_token"), opt("TELEGRAM_CHAT_ID", "telegram_chat_id")
+SL = float(opt("SL_POINTS", "sl_points", "65"))
+TEST = os.environ.get("TEST", "").strip().lower() == "yes"
+SCHED = os.environ.get("SCHED", "").strip()
+# cloud runs in 2 parts: part 1 till 12:40, part 2 from 12:40 (GitHub max job time)
+RESP_START, END_HHMM = (1240, 1535) if SCHED.startswith("47 6") else ((0, 1240) if SCHED else (0, 1535))
 START_HHMM, LAST_HHMM = 930, 1300
 
 def now():
@@ -40,9 +47,10 @@ def tg_chat_id():
         m = u.get("message") or u.get("channel_post")
         if m:
             TG_CHAT = str(m["chat"]["id"])
-            cfg["settings"]["telegram_chat_id"] = TG_CHAT
-            with open(CFG_PATH, "w", encoding="utf-8") as f:
-                cfg.write(f)
+            if cfg.has_section("settings"):
+                cfg["settings"]["telegram_chat_id"] = TG_CHAT
+                with open(CFG_PATH, "w", encoding="utf-8") as f:
+                    cfg.write(f)
             return TG_CHAT
     sys.exit("Telegram chat id kidaikkala: unga bot-ku Telegram-la 'hi' anuppitu marupadi start pannunga.")
 
@@ -145,7 +153,7 @@ def features(m15, daily):
 def replay_today(d, today):
     """Walk today's completed candles exactly like the strategy. Returns state dict."""
     s = dict(traded=False, dir=0, entry=None, stop=None, be=False, exited=False, exit_px=None,
-             reason="", src="", entry_time=None, exit_time=None)
+             reason="", src="", entry_time=None, exit_time=None, be_time=None)
     t = d[d.date == today]
     for _, r in t.iterrows():
         if s["dir"] != 0 and not s["exited"]:
@@ -155,7 +163,7 @@ def replay_today(d, today):
             elif s["dir"] == -1 and r.h >= s["stop"]:
                 s.update(exited=True, exit_px=max(s["stop"], r.o), reason="BE" if s["be"] else "SL", exit_time=r.ct)
             elif not s["be"] and ((s["dir"] == 1 and r.h >= s["entry"] + SL) or (s["dir"] == -1 and r.l <= s["entry"] - SL)):
-                s.update(stop=s["entry"], be=True)
+                s.update(stop=s["entry"], be=True, be_time=r.ct)
             if not s["exited"] and r.hhmm >= 1515:
                 s.update(exited=True, exit_px=r.c, reason="3:15", exit_time=r.ct)
         if not s["traded"] and START_HHMM <= r.hhmm < LAST_HHMM and not pd.isna(r.pC):
@@ -171,68 +179,29 @@ def itm_strike(entry, dr):
     return (atm - 50, "CE") if dr == 1 else (atm + 50, "PE")
 
 # ---------------- main loop ----------------
+def hm(t):
+    return t.hour * 100 + t.minute
+
 def main():
     tg_chat_id()
     obj = angel_login()
     log("Angel login OK")
+    if TEST:
+        p = ltp(obj)
+        tg(f"✅ Bot connected!\nAngel login OK, NIFTY LTP: {p}\nTelegram chat id: {tg_chat_id()}\n(Indha number-a TELEGRAM_CHAT_ID secret-a podunga)")
+        return
     today = now().date()
-    hist = candles(obj, "FIFTEEN_MINUTE", 45)
     daily = candles(obj, "ONE_DAY", 30)
     if (daily.t.dt.date == today).sum() == 0:
         daily = pd.concat([daily, pd.DataFrame([{"t": pd.Timestamp(now()).normalize(), "o": np.nan, "h": np.nan, "l": np.nan, "c": np.nan}])], ignore_index=True)
-    tg(f"Trigger-3 bot START ({today:%d %b})\nSL {SL:.0f} pts | 9:30-1:00 entry | 3:15 exit\nSignal vandha inga message varum.")
+    if RESP_START == 0:
+        tg(f"Trigger-3 bot START ({today:%d %b})\nSL {SL:.0f} pts | 9:30-1:00 entry | 3:15 exit\nSignal vandha inga message varum.")
     sent = set()
+    def fresh(t):  # announce only events in this run's time slot
+        return t is None or hm(t) >= RESP_START
     while True:
         try:
             t_now = now()
-            if t_now.hour * 100 + t_now.minute >= 1532:
+            if hm(t_now) >= END_HHMM:
                 break
-            m15 = candles(obj, "FIFTEEN_MINUTE", 45)
-            done = m15[m15.t + pd.Timedelta(minutes=15) <= t_now - pd.Timedelta(seconds=5)]
-            forming = m15[m15.t + pd.Timedelta(minutes=15) > t_now - pd.Timedelta(seconds=5)]
-            d = features(done, daily)
-            s = replay_today(d, today)
-            px = ltp(obj)
-            # live (intra-candle) stop check with forming candle + LTP
-            if s["dir"] != 0 and not s["exited"]:
-                lows = [x for x in [px] + list(forming.l) if x is not None]
-                highs = [x for x in [px] + list(forming.h) if x is not None]
-                if s["dir"] == 1 and lows and min(lows) <= s["stop"]:
-                    s.update(exited=True, exit_px=s["stop"], reason="BE" if s["be"] else "SL")
-                if s["dir"] == -1 and highs and max(highs) >= s["stop"]:
-                    s.update(exited=True, exit_px=s["stop"], reason="BE" if s["be"] else "SL")
-            if s["traded"] and "entry" not in sent:
-                k, typ = itm_strike(s["entry"], s["dir"])
-                side = "BUY  ->  CE vaangu" if s["dir"] == 1 else "SELL  ->  PE vaangu"
-                tg(f"🔔 {side}\nNIFTY entry: {s['entry']:.1f}  ({s['src']})\nOption: NIFTY {k} {typ} (1-ITM, next-week expiry)\nSL (NIFTY): {s['stop']:.1f}\nNIFTY SL-a thottaa option-a vithudu.")
-                sent.add("entry")
-            if s["be"] and "be" not in sent and not s["exited"] and "exit" not in sent:
-                tg(f"✅ +{SL:.0f} points vanthuduchu. SL ippo entry {s['entry']:.1f} (breakeven). Inime nashtam illa.")
-                sent.add("be")
-            if s["exited"] and "exit" not in sent:
-                pts = (s["exit_px"] - s["entry"]) * s["dir"]
-                why = {"SL": "SL hit", "BE": "Breakeven exit", "3:15": "3:15 exit"}[s["reason"]]
-                tg(f"⏹ EXIT ({why})\nNIFTY {s['exit_px']:.1f}  |  {pts:+.1f} points\nOption-a ippo vithudu. Innaikku trade mudinjathu.")
-                sent.add("exit")
-            if s["traded"] and not s["exited"] and t_now.hour * 100 + t_now.minute >= 1515 and "exit" not in sent:
-                pts = ((px or s["entry"]) - s["entry"]) * s["dir"]
-                tg(f"⏹ 3:15 EXIT\nNIFTY {px}  |  {pts:+.1f} points\nOption-a ippo vithudu.")
-                sent.add("exit")
-            if not s["traded"] and t_now.hour * 100 + t_now.minute >= 1300 and "nosig" not in sent:
-                tg("Innaikku 1 manikku munnadi signal varala. Trade illa.")
-                sent.add("nosig")
-            log(f"ltp {px} | traded {s['traded']} dir {s['dir']} stop {s['stop']} be {s['be']} exited {s['exited']}")
-        except Exception as e:
-            log("ERROR " + repr(e))
-            traceback.print_exc()
-            if "token" in repr(e).lower() or "session" in repr(e).lower():
-                try:
-                    obj = angel_login()
-                except Exception as e2:
-                    log("relogin failed " + repr(e2))
-        # wake ~10s after each minute
-        time.sleep(60 - now().second + 10)
-    tg("Market mudinjathu. Bot stop aagudhu. Naalaikku marupadi start pannunga.")
-
-if __name__ == "__main__":
-    main()
+            if hm(t_now) 
