@@ -19,7 +19,9 @@ def opt(env, key, default=""):
 API_KEY, CLIENT, PIN, TOTP = opt("API_KEY", "api_key"), opt("CLIENT_ID", "client_id"), opt("PIN", "pin"), opt("TOTP_SECRET", "totp_secret")
 TG_TOKEN, TG_CHAT = opt("TELEGRAM_TOKEN", "telegram_token"), opt("TELEGRAM_CHAT_ID", "telegram_chat_id")
 SL = float(opt("SL_POINTS", "sl_points", "65"))
-TEST = os.environ.get("TEST", "").strip().lower() == "yes"
+TMODE = os.environ.get("TEST", "").strip().lower()
+TEST = TMODE == "yes"
+REPLAY = TMODE == "replay"
 SCHED = os.environ.get("SCHED", "").strip()
 # cloud runs in 2 parts: part 1 till 12:40, part 2 from 12:40 (GitHub max job time)
 RESP_START, END_HHMM = (1240, 1535) if SCHED.startswith("47 6") else ((0, 1240) if SCHED else (0, 1535))
@@ -189,6 +191,18 @@ def main():
     if TEST:
         p = ltp(obj)
         tg(f"✅ Bot connected!\nAngel login OK, NIFTY LTP: {p}\nTelegram chat id: {tg_chat_id()}\n(Indha number-a TELEGRAM_CHAT_ID secret-a podunga)")
+        return
+    if REPLAY:
+        daily = candles(obj, "ONE_DAY", 30)
+        d = features(candles(obj, "FIFTEEN_MINUTE", 45), daily)
+        day = max(d.date)
+        s = replay_today(d, day)
+        if not s["traded"]:
+            tg(f"REPLAY {day:%d %b}: signal illa, trade illa.")
+        else:
+            k, typ = itm_strike(s["entry"], s["dir"])
+            pts = (s["exit_px"] - s["entry"]) * s["dir"] if s["exited"] else 0
+            tg(f"REPLAY {day:%d %b}\n{'BUY' if s['dir'] == 1 else 'SELL'} ({s['src']}) at {s['entry_time']:%H:%M}\nEntry {s['entry']:.1f} | Option NIFTY {k} {typ}\nBreakeven: {'yes' if s['be'] else 'no'}\nExit: {s['reason']} at {s['exit_px']:.1f}\nResult: {pts:+.1f} points")
         return
     today = now().date()
     daily = candles(obj, "ONE_DAY", 30)
