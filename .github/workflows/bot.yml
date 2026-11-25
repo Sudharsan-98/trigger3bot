@@ -6,12 +6,17 @@ on:
   workflow_dispatch:
     inputs:
       test:
-        description: 'Test only? (yes/no)'
+        description: 'Mode'
+        type: choice
+        options:
+          - 'yes'
+          - 'replay'
+          - 'no'
         default: 'yes'
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 290
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
