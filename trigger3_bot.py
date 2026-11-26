@@ -19,12 +19,14 @@ def opt(env, key, default=""):
 API_KEY, CLIENT, PIN, TOTP = opt("API_KEY", "api_key"), opt("CLIENT_ID", "client_id"), opt("PIN", "pin"), opt("TOTP_SECRET", "totp_secret")
 TG_TOKEN, TG_CHAT = opt("TELEGRAM_TOKEN", "telegram_token"), opt("TELEGRAM_CHAT_ID", "telegram_chat_id")
 SL = float(opt("SL_POINTS", "sl_points", "65"))
+TRAIL = float(opt("TRAIL_POINTS", "trail_points", "0"))   # trail SL this many points behind best price (0 = off)
 TMODE = os.environ.get("TEST", "").strip().lower()
 TEST = TMODE == "yes"
 REPLAY = TMODE == "replay"
+BACKTEST = TMODE == "backtest"
 SCHED = os.environ.get("SCHED", "").strip()
 # cloud runs in 2 parts: part 1 till 12:40, part 2 from 12:40 (GitHub max job time)
-RESP_START, END_HHMM = (1240, 1535) if SCHED.startswith("47 6") else ((0, 1240) if SCHED else (0, 1535))
+RESP_START, END_HHMM = (1240, 1535) if (SCHED.startswith("47 6") or TMODE == "p2") else ((0, 1240) if (SCHED or TMODE == "p1") else (0, 1535))
 START_HHMM, LAST_HHMM = 930, 1300
 
 def now():
@@ -60,9 +62,13 @@ def tg(msg):
     log("TG: " + msg.replace("\n", " | "))
     for _ in range(3):
         try:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                          data={"chat_id": tg_chat_id(), "text": msg}, timeout=20)
-            return
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                              data={"chat_id": tg_chat_id(), "text": msg}, timeout=20)
+            if r.ok:
+                return
+            log(f"telegram not ok: {r.text[:200]}")
+            time.sleep(3)
+            continue
         except Exception as e:
             log(f"telegram error {e}")
             time.sleep(3)
@@ -70,30 +76,79 @@ def tg(msg):
 # ---------------- angel ----------------
 def angel_login():
     from SmartApi import SmartConnect
-    obj = SmartConnect(api_key=API_KEY)
-    d = obj.generateSession(CLIENT, PIN, pyotp.TOTP(TOTP).now())
-    if not d or not d.get("status"):
-        raise RuntimeError(f"Angel login failed: {d}")
-    return obj
+    last = None
+    for k in range(8):
+        try:
+            obj = SmartConnect(api_key=API_KEY)
+            d = obj.generateSession(CLIENT, PIN, pyotp.TOTP(TOTP).now())
+            if d and d.get("status"):
+                return obj
+            last = d
+        except Exception as e:
+            last = repr(e)[:200]
+        log(f"login retry {k + 1}: {last}")
+        time.sleep(20)
+    raise RuntimeError(f"Angel login failed: {last}")
 
 def candles(obj, interval, days):
     end = now()
     start = end - dt.timedelta(days=days)
     p = {"exchange": "NSE", "symboltoken": NIFTY_TOKEN, "interval": interval,
          "fromdate": start.strftime("%Y-%m-%d 09:00"), "todate": end.strftime("%Y-%m-%d %H:%M")}
-    for _ in range(3):
-        r = obj.getCandleData(p)
-        if r and r.get("status") and r.get("data"):
-            df = pd.DataFrame(r["data"], columns=["t", "o", "h", "l", "c", "v"])
-            df["t"] = pd.to_datetime(df["t"]).dt.tz_convert(IST)
-            return df.drop(columns="v")
-        time.sleep(2)
+    r = None
+    for k in range(6):
+        try:
+            r = obj.getCandleData(p)
+            if r and r.get("status") and r.get("data"):
+                df = pd.DataFrame(r["data"], columns=["t", "o", "h", "l", "c", "v"])
+                df["t"] = pd.to_datetime(df["t"]).dt.tz_convert(IST)
+                return df.drop(columns="v")
+        except Exception as e:
+            r = repr(e)[:200]
+        log(f"candle retry {k + 1}: {r}")
+        time.sleep(15)
     raise RuntimeError(f"candle fetch failed: {r}")
 
 def ltp(obj):
     try:
         r = obj.ltpData("NSE", NIFTY_SYM, NIFTY_TOKEN)
         return float(r["data"]["ltp"])
+    except Exception:
+        return None
+
+# ---------------- option lookup (Angel scrip master) ----------------
+SCRIP_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+_SCRIP = []
+
+def load_scrips():
+    global _SCRIP
+    if _SCRIP:
+        return _SCRIP
+    try:
+        data = requests.get(SCRIP_URL, timeout=90).json()
+        _SCRIP = [r for r in data if r.get("exch_seg") == "NFO" and r.get("name") == "NIFTY" and r.get("instrumenttype") == "OPTIDX"]
+        log(f"scrip master loaded: {len(_SCRIP)} NIFTY options")
+    except Exception as e:
+        log("scrip master load failed " + repr(e))
+    return _SCRIP
+
+def find_option(strike, typ):
+    """Nearest expiry that is at least 2 days away."""
+    today = now().date()
+    best = None
+    for r in load_scrips():
+        try:
+            exp = dt.datetime.strptime(r["expiry"], "%d%b%Y").date()
+            if (exp - today).days >= 2 and abs(float(r["strike"]) / 100 - strike) == 0 and r["symbol"].endswith(typ):
+                if best is None or best[0] > exp:
+                    best = (exp, r)
+        except Exception:
+            continue
+    return best
+
+def opt_ltp(obj, r):
+    try:
+        return float(obj.ltpData("NFO", r["symbol"], r["token"])["data"]["ltp"])
     except Exception:
         return None
 
@@ -155,17 +210,24 @@ def features(m15, daily):
 def replay_today(d, today):
     """Walk today's completed candles exactly like the strategy. Returns state dict."""
     s = dict(traded=False, dir=0, entry=None, stop=None, be=False, exited=False, exit_px=None,
-             reason="", src="", entry_time=None, exit_time=None, be_time=None)
+             reason="", src="", entry_time=None, exit_time=None, be_time=None, best=0.0)
     t = d[d.date == today]
     for _, r in t.iterrows():
         if s["dir"] != 0 and not s["exited"]:
             # stop check (orders from previous candle)
+            why = ("TRAIL" if (s["stop"] - s["entry"]) * s["dir"] > 0.01 else "BE") if s["be"] else "SL"
             if s["dir"] == 1 and s["stop"] >= r.l:
-                s.update(exited=True, exit_px=min(s["stop"], r.o), reason="BE" if s["be"] else "SL", exit_time=r.ct)
+                s.update(exited=True, exit_px=min(s["stop"], r.o), reason=why, exit_time=r.ct)
             elif s["dir"] == -1 and r.h >= s["stop"]:
-                s.update(exited=True, exit_px=max(s["stop"], r.o), reason="BE" if s["be"] else "SL", exit_time=r.ct)
-            elif not s["be"] and ((s["dir"] == 1 and r.h >= s["entry"] + SL) or (s["dir"] == -1 and s["entry"] - SL >= r.l)):
-                s.update(stop=s["entry"], be=True, be_time=r.ct)
+                s.update(exited=True, exit_px=max(s["stop"], r.o), reason=why, exit_time=r.ct)
+            else:
+                fav = (r.h - s["entry"]) if s["dir"] == 1 else (s["entry"] - r.l)
+                s["best"] = max(s["best"], fav)
+                if not s["be"] and s["best"] >= SL:
+                    s.update(stop=s["entry"], be=True, be_time=r.ct)
+                if TRAIL > 0 and s["best"] >= TRAIL:
+                    ns = s["entry"] + s["dir"] * (s["best"] - TRAIL)
+                    s["stop"] = max(s["stop"], ns) if s["dir"] == 1 else min(s["stop"], ns)
             if not s["exited"] and r.hhmm >= 1515:
                 s.update(exited=True, exit_px=r.c, reason="3:15", exit_time=r.ct)
         if not s["traded"] and r.hhmm >= START_HHMM and LAST_HHMM > r.hhmm and not pd.isna(r.pC):
@@ -180,6 +242,58 @@ def itm_strike(entry, dr):
     atm = round(entry / 50) * 50
     return (atm - 50, "CE") if dr == 1 else (atm + 50, "PE")
 
+# ---------------- backtest (Angel history) ----------------
+def fetch_range(obj, interval, start, end, chunk_days):
+    frames = []
+    cur = start
+    while end > cur:
+        nxt = min(cur + dt.timedelta(days=chunk_days), end)
+        p = {"exchange": "NSE", "symboltoken": NIFTY_TOKEN, "interval": interval,
+             "fromdate": cur.strftime("%Y-%m-%d 09:00"), "todate": nxt.strftime("%Y-%m-%d 15:30")}
+        r = None
+        for _ in range(4):
+            try:
+                r = obj.getCandleData(p)
+                if r and r.get("status"):
+                    break
+            except Exception as e:
+                log("fetch err " + repr(e)[:200])
+            time.sleep(3)
+        if r and r.get("data"):
+            df = pd.DataFrame(r["data"], columns=["t", "o", "h", "l", "c", "v"])
+            df["t"] = pd.to_datetime(df["t"]).dt.tz_convert(IST)
+            frames.append(df.drop(columns="v"))
+            log(f"{interval} {cur:%Y-%m-%d} -> {nxt:%Y-%m-%d}: {len(df)} candles")
+        cur = nxt + dt.timedelta(days=1)
+        time.sleep(1.5)
+    return pd.concat(frames).drop_duplicates("t").sort_values("t").reset_index(drop=True)
+
+def run_bt(d, days, trail):
+    global TRAIL
+    keep = TRAIL
+    TRAIL = trail
+    rows = []
+    for day in days:
+        s = replay_today(d, day)
+        if s["traded"] and s["exited"]:
+            rows.append((day, (s["exit_px"] - s["entry"]) * s["dir"], s["reason"]))
+    TRAIL = keep
+    return pd.DataFrame(rows, columns=["date", "pts", "why"])
+
+def bt_report(t, title):
+    t = t.copy()
+    t["m"] = pd.to_datetime(t.date).dt.strftime("%b %y")
+    t["mk"] = pd.to_datetime(t.date).dt.strftime("%Y-%m")
+    t["opt"] = (0.6 * t.pts - 5) * 65 - 80
+    g = t.groupby(["mk", "m"]).agg(n=("pts", "size"), w=("pts", lambda x: int((x > 0).sum())),
+                                    pts=("pts", "sum"), opt=("opt", "sum")).reset_index()
+    lines = [title, "Month | trades | win | points | option Rs (1 lot)"]
+    for _, r in g.iterrows():
+        lines.append(f"{r.m}: {r.n} | {r.w} | {r.pts:+.0f} | {r.opt:+,.0f}")
+    lines.append(f"TOTAL: {len(t)} trades | win {int((t.pts > 0).sum())} | {t.pts.sum():+.0f} pts | Rs {t.opt.sum():+,.0f}")
+    lines.append(f"Profit months: {int((g.opt > 0).sum())}/{len(g)} | best Rs {g.opt.max():+,.0f} | worst Rs {g.opt.min():+,.0f}")
+    return "\n".join(lines), g
+
 # ---------------- main loop ----------------
 def hm(t):
     return t.hour * 100 + t.minute
@@ -190,7 +304,27 @@ def main():
     log("Angel login OK")
     if TEST:
         p = ltp(obj)
-        tg(f"✅ Bot connected!\nAngel login OK, NIFTY LTP: {p}\nTelegram chat id: {tg_chat_id()}\n(Indha number-a TELEGRAM_CHAT_ID secret-a podunga)")
+        k, typ = itm_strike(p or 25000, 1)
+        bo = find_option(k, typ)
+        ot = f"{bo[1]['symbol']} = Rs {opt_ltp(obj, bo[1])}" if bo else "option kidaikkala"
+        tg(f"✅ Bot connected!\nAngel login OK, NIFTY LTP: {p}\nOption check: {ot}\nTelegram chat id: {tg_chat_id()}")
+        return
+    if BACKTEST:
+        end = now()
+        start = dt.datetime(2024, 11, 1, 9, 0, tzinfo=IST)
+        tg("Backtest start: Jan 2025 - innaikku varai data edukkuren (2-3 nimisham)...")
+        m15 = fetch_range(obj, "FIFTEEN_MINUTE", start, end, 90)
+        daily = fetch_range(obj, "ONE_DAY", start - dt.timedelta(days=10), end, 1500)
+        m15 = m15[(m15.t.dt.hour * 100 + m15.t.dt.minute) >= 915]
+        d = features(m15, daily)
+        today = end.date()
+        days = sorted(x for x in d.date.unique() if x >= dt.date(2025, 1, 1) and today > x)
+        log(f"backtest days: {len(days)}")
+        for trail, name in [(0, "CURRENT rules (BE + 3:15)"), (250, "With Trail 250")]:
+            t = run_bt(d, days, trail)
+            txt, g = bt_report(t, f"BACKTEST {name}\nSL {SL:.0f}, 1 lot = 65, option = estimate")
+            tg(txt)
+            t.to_csv(os.path.join(HERE, f"backtest_trail{trail}.csv"), index=False)
         return
     if REPLAY:
         daily = candles(obj, "ONE_DAY", 30)
@@ -205,14 +339,20 @@ def main():
             tg(f"REPLAY {day:%d %b}\n{'BUY' if s['dir'] == 1 else 'SELL'} ({s['src']}) at {s['entry_time']:%H:%M}\nEntry {s['entry']:.1f} | Option NIFTY {k} {typ}\nBreakeven: {'yes' if s['be'] else 'no'}\nExit: {s['reason']} at {s['exit_px']:.1f}\nResult: {pts:+.1f} points")
         return
     today = now().date()
+    load_scrips()
+    opt = {}
     daily = candles(obj, "ONE_DAY", 30)
     if (daily.t.dt.date == today).sum() == 0:
         daily = pd.concat([daily, pd.DataFrame([{"t": pd.Timestamp(now()).normalize(), "o": np.nan, "h": np.nan, "l": np.nan, "c": np.nan}])], ignore_index=True)
     if RESP_START == 0:
-        tg(f"Trigger-3 bot START ({today:%d %b})\nSL {SL:.0f} pts | 9:30-1:00 entry | 3:15 exit\nSignal vandha inga message varum.")
+        tg(f"Trigger-3 bot START ({today:%d %b})\nSL {SL:.0f} | BE +{SL:.0f} | Trail {TRAIL:.0f} | 9:30-1:00 entry | 3:15 exit\nSignal vandha inga message varum.")
     sent = set()
     def fresh(t):  # announce only events in this run's time slot
         return t is None or hm(t) >= RESP_START
+    m15 = None
+    fetched_slot = None
+    trail_sent = 0.0
+    lo_live = hi_live = None
     while True:
         try:
             t_now = now()
@@ -220,52 +360,92 @@ def main():
                 break
             if 915 > hm(t_now):
                 time.sleep(60); continue
-            m15 = candles(obj, "FIFTEEN_MINUTE", 45)
+            # candles: fetch only when a new 15-min candle should be complete (saves API calls)
+            day0 = pd.Timestamp(t_now).normalize() + pd.Timedelta(hours=9, minutes=15)
+            slot = int((pd.Timestamp(t_now) - day0).total_seconds() // 900)
+            prev_start = day0 + pd.Timedelta(minutes=15 * (slot - 1))
+            need = m15 is None or slot != fetched_slot
+            if need:
+                m15 = candles(obj, "FIFTEEN_MINUTE", 45)
+                lo_live = hi_live = None
+                # mark this slot done only when the just-closed candle is in the data
+                if slot == 0 or (m15.t == prev_start).any():
+                    fetched_slot = slot
             if (m15.t.dt.date == today).sum() == 0:
                 if hm(t_now) >= 1000:
                     log("no candles today - holiday?"); break
+                m15 = None
                 time.sleep(60); continue
             done = m15[t_now - pd.Timedelta(seconds=5) >= m15.t + pd.Timedelta(minutes=15)]
-            forming = m15[m15.t + pd.Timedelta(minutes=15) > t_now - pd.Timedelta(seconds=5)]
             d = features(done, daily)
             s = replay_today(d, today)
             px = ltp(obj)
-            if s["dir"] != 0 and not s["exited"]:
-                lows = [x for x in [px] + list(forming.l) if x is not None]
-                highs = [x for x in [px] + list(forming.h) if x is not None]
-                if (s["dir"] == 1 and lows and s["stop"] >= min(lows)) or (s["dir"] == -1 and highs and max(highs) >= s["stop"]):
-                    s.update(exited=True, exit_px=s["stop"], reason="BE" if s["be"] else "SL", exit_time=t_now)
+            if px is not None:
+                lo_live = px if lo_live is None else min(lo_live, px)
+                hi_live = px if hi_live is None else max(hi_live, px)
+            if s["dir"] != 0 and not s["exited"] and lo_live is not None:
+                if (s["dir"] == 1 and s["stop"] >= lo_live) or (s["dir"] == -1 and hi_live >= s["stop"]):
+                    lr = ("TRAIL" if (s["stop"] - s["entry"]) * s["dir"] > 0.01 else "BE") if s["be"] else "SL"
+                    s.update(exited=True, exit_px=s["stop"], reason=lr, exit_time=t_now)
             if s["traded"] and "entry" not in sent:
                 sent.add("entry")
+                k, typ = itm_strike(s["entry"], s["dir"])
+                bo = find_option(k, typ)
+                if bo:
+                    opt.update(r=bo[1], exp=bo[0], px=opt_ltp(obj, bo[1]))
                 if fresh(s["entry_time"]):
-                    k, typ = itm_strike(s["entry"], s["dir"])
                     side = "BUY  ->  CE vaangu" if s["dir"] == 1 else "SELL  ->  PE vaangu"
-                    tg(f"🔔 {side}\nNIFTY entry: {s['entry']:.1f}  ({s['src']})\nOption: NIFTY {k} {typ} (1-ITM, next-week expiry)\nSL (NIFTY): {s['stop'] if not s['be'] else s['entry'] - s['dir'] * SL:.1f}\nNIFTY SL-a thottaa option-a vithudu.")
+                    oname = f"NIFTY {opt['exp']:%d %b} {k} {typ}" if opt else f"NIFTY {k} {typ}"
+                    oprice = f"\nOption price ippo: Rs {opt['px']}" if opt.get("px") else ""
+                    tg(f"🔔 {side}\nNIFTY entry: {s['entry']:.1f}  ({s['src']})\nOption: {oname} (1-ITM){oprice}\nSL (NIFTY): {s['entry'] - s['dir'] * SL:.1f}\nNIFTY SL-a thottaa option-a vithudu.")
             if s["be"] and "be" not in sent and "exit" not in sent:
                 sent.add("be")
                 if fresh(s["be_time"]) and not s["exited"]:
-                    tg(f"✅ +{SL:.0f} points vanthuduchu. SL ippo entry {s['entry']:.1f} (breakeven). Inime nashtam illa.")
+                    op = opt_ltp(obj, opt["r"]) if opt else None
+                    tg(f"✅ +{SL:.0f} points vanthuduchu. SL ippo entry {s['entry']:.1f} (breakeven). Inime nashtam illa." + (f"\nOption price ippo: Rs {op}" if op else ""))
+            if s["be"] and not s["exited"] and "exit" not in sent:
+                locked = (s["stop"] - s["entry"]) * s["dir"]
+                if locked - trail_sent >= 25:
+                    trail_sent = locked
+                    op = opt_ltp(obj, opt["r"]) if opt else None
+                    tg(f"🔼 Trailing SL ethiyachu: NIFTY SL ippo {s['stop']:.1f}  (+{locked:.0f} points lock)" + (f"\nOption price ippo: Rs {op}" if op else ""))
             if s["exited"] and "exit" not in sent:
                 sent.add("exit")
                 if fresh(s["exit_time"]):
                     pts = (s["exit_px"] - s["entry"]) * s["dir"]
-                    why = {"SL": "SL hit", "BE": "Breakeven exit", "3:15": "3:15 exit"}[s["reason"]]
-                    tg(f"⏹ EXIT ({why})\nNIFTY {s['exit_px']:.1f}  |  {pts:+.1f} points\nOption-a ippo vithudu. Innaikku trade mudinjathu.")
+                    why = {"SL": "SL hit", "BE": "Breakeven exit", "TRAIL": "Trailing SL exit", "3:15": "3:15 exit"}[s["reason"]]
+                    op = opt_ltp(obj, opt["r"]) if opt else None
+                    ol = ""
+                    if op and opt.get("px"):
+                        ol = f"\nOption: Rs {opt['px']} -> Rs {op}  =  Rs {(op - opt['px']) * 65:+.0f} (1 lot)"
+                    elif op:
+                        ol = f"\nOption price ippo: Rs {op}"
+                    tg(f"⏹ EXIT ({why})\nNIFTY {s['exit_px']:.1f}  |  {pts:+.1f} points{ol}\nOption-a ippo vithudu. Innaikku trade mudinjathu.")
             if s["traded"] and not s["exited"] and hm(t_now) >= 1515 and "exit" not in sent:
                 sent.add("exit")
                 pts = ((px or s["entry"]) - s["entry"]) * s["dir"]
-                tg(f"⏹ 3:15 EXIT\nNIFTY {px}  |  {pts:+.1f} points\nOption-a ippo vithudu.")
+                op = opt_ltp(obj, opt["r"]) if opt else None
+                ol = ""
+                if op and opt.get("px"):
+                    ol = f"\nOption: Rs {opt['px']} -> Rs {op}  =  Rs {(op - opt['px']) * 65:+.0f} (1 lot)"
+                elif op:
+                    ol = f"\nOption price ippo: Rs {op}"
+                tg(f"⏹ 3:15 EXIT\nNIFTY {px}  |  {pts:+.1f} points{ol}\nOption-a ippo vithudu.")
             if not s["traded"] and hm(t_now) >= 1300 and "nosig" not in sent:
                 sent.add("nosig")
                 tg("Innaikku 1 manikku munnadi signal varala. Trade illa.")
             log(f"ltp {px} | traded {s['traded']} dir {s['dir']} stop {s['stop']} be {s['be']} exited {s['exited']}")
         except Exception as e:
-            log("ERROR " + repr(e))
-            traceback.print_exc()
-            try:
-                obj = angel_login()
-            except Exception as e2:
-                log("relogin failed " + repr(e2))
+            msg = repr(e).lower()
+            log("ERROR " + repr(e)[:300])
+            if "access rate" in msg:
+                time.sleep(30)
+            elif "token" in msg or "session" in msg or "invalid" in msg or "unauthor" in msg:
+                time.sleep(5)
+                try:
+                    obj = angel_login()
+                except Exception as e2:
+                    log("relogin failed " + repr(e2)[:300])
         time.sleep(max(5, 60 - now().second + 10))
     if END_HHMM >= 1535:
         tg("Market mudinjathu. Bot stop aagudhu.")
