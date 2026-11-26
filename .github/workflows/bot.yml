@@ -1,22 +1,22 @@
 name: trigger3
 on:
-  schedule:
-    - cron: '13 3 * * 1-5'   # 8:43 IST  (part 1, till 12:40)
-    - cron: '47 6 * * 1-5'   # 12:17 IST (part 2, till 15:35)
   workflow_dispatch:
     inputs:
       test:
         description: 'Mode'
         type: choice
         options:
+          - 'no'
+          - 'p1'
+          - 'p2'
           - 'yes'
           - 'replay'
-          - 'no'
-        default: 'yes'
+          - 'backtest'
+        default: 'no'
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,6 +31,5 @@ jobs:
           TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SCHED: ${{ github.event.schedule }}
           TEST: ${{ github.event.inputs.test }}
         run: python trigger3_bot.py
