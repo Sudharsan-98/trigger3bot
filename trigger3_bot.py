@@ -186,8 +186,10 @@ def features(m15, daily):
     # previous day H/L/C from daily candles
     dd = daily.copy(); dd["date"] = dd.t.dt.date
     dd = dd.set_index("date")[["h", "l", "c"]].sort_index()
+    rngd = dd.h - dd.l
+    dd["nr7"] = (rngd == rngd.rolling(7).min()).astype(float)
     prevmap = dd.shift(1)
-    d = d.join(prevmap.rename(columns={"h": "pH", "l": "pL", "c": "pC"}), on="date")
+    d = d.join(prevmap.rename(columns={"h": "pH", "l": "pL", "c": "pC", "nr7": "pNR7"}), on="date")
     pp = (d.pH + d.pL + d.pC) / 3; bc0 = (d.pH + d.pL) / 2; tc0 = 2 * pp - bc0
     d["TC"] = np.maximum(tc0, bc0); d["BC"] = np.minimum(tc0, bc0)
     pc = d.c.shift(1)
@@ -210,7 +212,7 @@ def features(m15, daily):
 def replay_today(d, today):
     """Walk today's completed candles exactly like the strategy. Returns state dict."""
     s = dict(traded=False, dir=0, entry=None, stop=None, be=False, exited=False, exit_px=None,
-             reason="", src="", entry_time=None, exit_time=None, be_time=None, best=0.0)
+             reason="", src="", entry_time=None, exit_time=None, be_time=None, best=0.0, aplus=False)
     t = d[d.date == today]
     for _, r in t.iterrows():
         if s["dir"] != 0 and not s["exited"]:
@@ -235,7 +237,11 @@ def replay_today(d, today):
             if gl != gs:
                 dr = 1 if gl else -1
                 src = ("CPR" if r.cprUp else "Supertrend" if r.stUp else "Noise") if gl else ("CPR" if r.cprDn else "Supertrend" if r.stDn else "Noise")
-                s.update(traded=True, dir=dr, entry=r.c, stop=r.c - dr * SL, src=src, entry_time=r.ct)
+                if dr == 1:
+                    q = (r.c > r.pH or r.pNR7 == 1) and r.c > r.dOpen and r.c > r.vw
+                else:
+                    q = (r.pL > r.c or r.pNR7 == 1) and r.dOpen > r.c and r.vw > r.c
+                s.update(traded=True, dir=dr, entry=r.c, stop=r.c - dr * SL, src=src, entry_time=r.ct, aplus=bool(q))
     return s
 
 def itm_strike(entry, dr):
@@ -276,9 +282,9 @@ def run_bt(d, days, trail):
     for day in days:
         s = replay_today(d, day)
         if s["traded"] and s["exited"]:
-            rows.append((day, (s["exit_px"] - s["entry"]) * s["dir"], s["reason"]))
+            rows.append((day, (s["exit_px"] - s["entry"]) * s["dir"], s["reason"], s["aplus"]))
     TRAIL = keep
-    return pd.DataFrame(rows, columns=["date", "pts", "why"])
+    return pd.DataFrame(rows, columns=["date", "pts", "why", "aplus"])
 
 def bt_report(t, title):
     t = t.copy()
@@ -320,11 +326,12 @@ def main():
         today = end.date()
         days = sorted(x for x in d.date.unique() if x >= dt.date(2025, 1, 1) and today > x)
         log(f"backtest days: {len(days)}")
-        for trail, name in [(0, "CURRENT rules (BE + 3:15)"), (250, "With Trail 250")]:
-            t = run_bt(d, days, trail)
-            txt, g = bt_report(t, f"BACKTEST {name}\nSL {SL:.0f}, 1 lot = 65, option = estimate")
-            tg(txt)
-            t.to_csv(os.path.join(HERE, f"backtest_trail{trail}.csv"), index=False)
+        t = run_bt(d, days, 0)
+        txt, g = bt_report(t, f"BACKTEST ALL signals\nSL {SL:.0f}, 1 lot = 65, option = estimate")
+        tg(txt)
+        txt, g = bt_report(t[t.aplus], f"BACKTEST A+ signals only\nSL {SL:.0f}, 1 lot = 65, option = estimate")
+        tg(txt)
+        t.to_csv(os.path.join(HERE, "backtest.csv"), index=False)
         return
     if REPLAY:
         daily = candles(obj, "ONE_DAY", 30)
@@ -336,7 +343,7 @@ def main():
         else:
             k, typ = itm_strike(s["entry"], s["dir"])
             pts = (s["exit_px"] - s["entry"]) * s["dir"] if s["exited"] else 0
-            tg(f"REPLAY {day:%d %b}\n{'BUY' if s['dir'] == 1 else 'SELL'} ({s['src']}) at {s['entry_time']:%H:%M}\nEntry {s['entry']:.1f} | Option NIFTY {k} {typ}\nBreakeven: {'yes' if s['be'] else 'no'}\nExit: {s['reason']} at {s['exit_px']:.1f}\nResult: {pts:+.1f} points")
+            tg(f"REPLAY {day:%d %b}\n{'BUY' if s['dir'] == 1 else 'SELL'} ({s['src']}) at {s['entry_time']:%H:%M} {'A+' if s['aplus'] else 'normal'}\nEntry {s['entry']:.1f} | Option NIFTY {k} {typ}\nBreakeven: {'yes' if s['be'] else 'no'}\nExit: {s['reason']} at {s['exit_px']:.1f}\nResult: {pts:+.1f} points")
         return
     today = now().date()
     load_scrips()
@@ -397,7 +404,8 @@ def main():
                     side = "BUY  ->  CE vaangu" if s["dir"] == 1 else "SELL  ->  PE vaangu"
                     oname = f"NIFTY {opt['exp']:%d %b} {k} {typ}" if opt else f"NIFTY {k} {typ}"
                     oprice = f"\nOption price ippo: Rs {opt['px']}" if opt.get("px") else ""
-                    tg(f"🔔 {side}\nNIFTY entry: {s['entry']:.1f}  ({s['src']})\nOption: {oname} (1-ITM){oprice}\nSL (NIFTY): {s['entry'] - s['dir'] * SL:.1f}\nNIFTY SL-a thottaa option-a vithudu.")
+                    ql = "⭐ A+ signal (high quality)" if s["aplus"] else "⚪ Normal signal (A+ illa)"
+                    tg(f"🔔 {side}\n{ql}\nNIFTY entry: {s['entry']:.1f}  ({s['src']})\nOption: {oname} (1-ITM){oprice}\nSL (NIFTY): {s['entry'] - s['dir'] * SL:.1f}\nNIFTY SL-a thottaa option-a vithudu.")
             if s["be"] and "be" not in sent and "exit" not in sent:
                 sent.add("be")
                 if fresh(s["be_time"]) and not s["exited"]:
